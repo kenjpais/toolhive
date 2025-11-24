@@ -41,8 +41,3 @@ cmd/thv-operator/.task/checksum/crdref-gen
 
 # Test coverage
 coverage*
-
-# Bundle documentation files (keep local only)
-bundle/IMPLEMENTATION_SUMMARY.md
-bundle/ONBOARDING.md
-bundle/README.md
