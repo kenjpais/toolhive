@@ -13,20 +13,48 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/oidc"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/runconfig/configmap/checksum"
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/vmcpconfig"
 )
 
 // ensureVmcpConfigConfigMap ensures the vmcp Config ConfigMap exists and is up to date
+// workloadNames is the list of workload names in the group, passed in to ensure consistency
+// across multiple calls that need the same workload list.
 func (r *VirtualMCPServerReconciler) ensureVmcpConfigConfigMap(
 	ctx context.Context,
 	vmcp *mcpv1alpha1.VirtualMCPServer,
+	workloadNames []string,
 ) error {
-	// Convert CRD to vmcp config using converter
-	converter := vmcpconfig.NewConverter()
+	ctxLogger := log.FromContext(ctx)
+
+	// Create OIDC resolver to handle all OIDC types (kubernetes, configMap, inline)
+	oidcResolver := oidc.NewResolver(r.Client)
+
+	// Convert CRD to vmcp config using converter with OIDC resolver and Kubernetes client
+	// The client is needed to fetch referenced VirtualMCPCompositeToolDefinition resources
+	converter, err := vmcpconfig.NewConverter(oidcResolver, r.Client)
+	if err != nil {
+		return fmt.Errorf("failed to create vmcp converter: %w", err)
+	}
 	config, err := converter.Convert(ctx, vmcp)
 	if err != nil {
 		return fmt.Errorf("failed to create vmcp Config from VirtualMCPServer: %w", err)
+	}
+
+	// If OutgoingAuth source is "discovered", we need to discover and include
+	// ExternalAuthConfig from MCPServers in the ConfigMap
+	if config.OutgoingAuth != nil && config.OutgoingAuth.Source == "discovered" {
+		// Build discovered OutgoingAuthConfig using the provided workload names
+		discoveredAuthConfig, err := r.buildOutgoingAuthConfig(ctx, vmcp, workloadNames)
+		if err != nil {
+			ctxLogger.V(1).Info("Failed to build discovered auth config, using spec-only config",
+				"error", err)
+		} else if discoveredAuthConfig != nil {
+			// Merge discovered config into the config
+			// The discovered config already includes inline overrides, so we can replace it
+			config.OutgoingAuth = discoveredAuthConfig
+		}
 	}
 
 	// Validate the vmcp Config before creating the ConfigMap

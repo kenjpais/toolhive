@@ -47,13 +47,26 @@ Configures authentication for clients connecting to the Virtual MCP server. Reus
 **Type**: `IncomingAuthConfig`
 
 **Fields**:
-- `oidcConfig` (OIDCConfigRef, optional): OIDC authentication configuration
+- `type` (string, required): Authentication type. Must be explicitly specified.
+  - `anonymous`: No authentication required (use this when no auth is needed)
+  - `oidc`: OIDC/OAuth2 authentication
+- `oidcConfig` (OIDCConfigRef, optional): OIDC authentication configuration (required when type=oidc)
 - `authzConfig` (AuthzConfigRef, optional): Authorization policy configuration
 
-**Example**:
+**Important**: The `type` field must always be explicitly specified. When no authentication is required, use `type: anonymous`.
+
+**Example (anonymous auth)**:
 ```yaml
 spec:
   incomingAuth:
+    type: anonymous
+```
+
+**Example (OIDC auth)**:
+```yaml
+spec:
+  incomingAuth:
+    type: oidc
     oidcConfig:
       type: kubernetes
       kubernetes:
@@ -80,7 +93,6 @@ Configures authentication from Virtual MCP to backend MCPServers.
 - `source` (string, optional): How backend authentication configurations are determined
   - `discovered` (default): Automatically discover from backend's `MCPServer.spec.externalAuthConfigRef`
   - `inline`: Explicit per-backend configuration in VirtualMCPServer
-  - `mixed`: Discover most, override specific backends
 - `default` (BackendAuthConfig, optional): Default behavior for backends without explicit auth config
 - `backends` (map[string]BackendAuthConfig, optional): Per-backend authentication overrides
 
@@ -90,7 +102,7 @@ spec:
   outgoingAuth:
     source: discovered
     default:
-      type: pass_through
+      type: discovered
 ```
 
 **Example (inline mode)**:
@@ -113,36 +125,12 @@ spec:
           headerFormat: "Bearer {token}"
 ```
 
-**Example (mixed mode)**:
-```yaml
-spec:
-  outgoingAuth:
-    source: mixed
-    default:
-      type: pass_through
-    backends:
-      # Override specific backends while others use discovery
-      slack:
-        type: service_account
-        serviceAccount:
-          credentialsRef:
-            name: slack-bot-override
-            key: token
-          headerName: Authorization
-          headerFormat: "Bearer {token}"
-      # Other backends (github, jira, etc.) will automatically
-      # discover auth config from their MCPServer.spec.externalAuthConfigRef
-```
-
 #### BackendAuthConfig
 
 **Fields**:
 - `type` (string, required): Authentication type
   - `discovered`: Automatically discover from backend
-  - `pass_through`: Forward client token unchanged
-  - `service_account`: Use service account credentials
   - `external_auth_config_ref`: Reference an MCPExternalAuthConfig resource
-- `serviceAccount` (ServiceAccountAuth, optional): Service account configuration (when type=service_account)
 - `externalAuthConfigRef` (ExternalAuthConfigRef, optional): Auth config reference (when type=external_auth_config_ref)
 
 ### `.spec.aggregation` (optional)
@@ -250,40 +238,6 @@ spec:
           arguments:
             pr: "{{.params.pr_number}}"
           dependsOn: ["confirm_deploy"]
-```
-
-### `.spec.tokenCache` (optional)
-
-Configures token caching behavior.
-
-**Type**: `TokenCacheConfig`
-
-**Fields**:
-- `provider` (string, optional, default: "memory"): Cache provider type (`memory` or `redis`)
-- `memory` (MemoryCacheConfig, optional): In-memory cache configuration
-- `redis` (RedisCacheConfig, optional): Redis cache configuration
-
-**Example (memory)**:
-```yaml
-spec:
-  tokenCache:
-    provider: memory
-    memory:
-      maxEntries: 1000
-      ttlOffset: 5m
-```
-
-**Example (redis)**:
-```yaml
-spec:
-  tokenCache:
-    provider: redis
-    redis:
-      address: redis:6379
-      db: 0
-      passwordRef:
-        name: redis-secret
-        key: password
 ```
 
 ### `.spec.operational` (optional)
@@ -421,6 +375,7 @@ spec:
 
   # Client authentication
   incomingAuth:
+    type: oidc
     oidcConfig:
       type: kubernetes
       kubernetes:
@@ -440,7 +395,7 @@ spec:
   outgoingAuth:
     source: discovered
     default:
-      type: pass_through
+      type: discovered
     backends:
       slack:  # Override for specific backend
         type: service_account
@@ -480,13 +435,6 @@ spec:
             title: "Incident {{.params.incident_id}} Analysis"
             description: "{{.steps.fetch_logs.output}}"
           dependsOn: ["fetch_logs"]
-
-  # Token caching
-  tokenCache:
-    provider: memory
-    memory:
-      maxEntries: 1000
-      ttlOffset: 5m
 
   # Operational settings
   operational:
@@ -555,7 +503,9 @@ status:
 
 The VirtualMCPServer CRD includes comprehensive validation:
 
-1. **Required Fields**: `spec.groupRef.name` must be specified
+1. **Required Fields**:
+   - `spec.groupRef.name` must be specified
+   - `spec.incomingAuth.type` must be explicitly specified (use `anonymous` when no auth is needed)
 2. **Reference Validation**: All references (groupRef, authConfigRef, toolConfigRef) must be valid
 3. **Conflict Resolution**: Priority strategy requires `priorityOrder` configuration
 4. **Composite Tools**: Must have unique names, valid steps with IDs, and proper dependencies

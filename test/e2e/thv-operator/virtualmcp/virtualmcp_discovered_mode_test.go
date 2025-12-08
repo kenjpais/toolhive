@@ -11,11 +11,11 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	"github.com/stacklok/toolhive/test/e2e/images"
 )
 
 var _ = Describe("VirtualMCPServer Discovered Mode", Ordered, func() {
@@ -30,34 +30,10 @@ var _ = Describe("VirtualMCPServer Discovered Mode", Ordered, func() {
 		vmcpNodePort    int32
 	)
 
-	vmcpServiceName := func() string {
-		return fmt.Sprintf("vmcp-%s", vmcpServerName)
-	}
-
 	BeforeAll(func() {
 		By("Creating MCPGroup")
-		mcpGroup := &mcpv1alpha1.MCPGroup{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      mcpGroupName,
-				Namespace: testNamespace,
-			},
-			Spec: mcpv1alpha1.MCPGroupSpec{
-				Description: "Test MCP Group for VirtualMCP discovered mode E2E tests",
-			},
-		}
-		Expect(k8sClient.Create(ctx, mcpGroup)).To(Succeed())
-
-		By("Waiting for MCPGroup to be ready")
-		Eventually(func() bool {
-			err := k8sClient.Get(ctx, types.NamespacedName{
-				Name:      mcpGroupName,
-				Namespace: testNamespace,
-			}, mcpGroup)
-			if err != nil {
-				return false
-			}
-			return mcpGroup.Status.Phase == mcpv1alpha1.MCPGroupPhaseReady
-		}, timeout, pollingInterval).Should(BeTrue())
+		CreateMCPGroupAndWait(ctx, k8sClient, mcpGroupName, testNamespace,
+			"Test MCP Group for VirtualMCP discovered mode E2E tests", timeout, pollingInterval)
 
 		By("Creating first backend MCPServer - fetch (streamable-http)")
 		backend1 := &mcpv1alpha1.MCPServer{
@@ -67,7 +43,7 @@ var _ = Describe("VirtualMCPServer Discovered Mode", Ordered, func() {
 			},
 			Spec: mcpv1alpha1.MCPServerSpec{
 				GroupRef:  mcpGroupName,
-				Image:     "ghcr.io/stackloklabs/gofetch/server:1.0.1",
+				Image:     images.GofetchServerImage,
 				Transport: "streamable-http",
 				ProxyPort: 8080,
 				McpPort:   8080,
@@ -83,7 +59,7 @@ var _ = Describe("VirtualMCPServer Discovered Mode", Ordered, func() {
 			},
 			Spec: mcpv1alpha1.MCPServerSpec{
 				GroupRef:  mcpGroupName,
-				Image:     "ghcr.io/stackloklabs/osv-mcp/server:0.0.7",
+				Image:     images.OSVMCPServerImage,
 				Transport: "streamable-http",
 				ProxyPort: 8080,
 				McpPort:   8080,
@@ -156,22 +132,7 @@ var _ = Describe("VirtualMCPServer Discovered Mode", Ordered, func() {
 		WaitForVirtualMCPServerReady(ctx, k8sClient, vmcpServerName, testNamespace, timeout)
 
 		By("Getting NodePort for VirtualMCPServer")
-		Eventually(func() error {
-			service := &corev1.Service{}
-			serviceName := vmcpServiceName()
-			err := k8sClient.Get(ctx, types.NamespacedName{
-				Name:      serviceName,
-				Namespace: testNamespace,
-			}, service)
-			if err != nil {
-				return err
-			}
-			if len(service.Spec.Ports) == 0 || service.Spec.Ports[0].NodePort == 0 {
-				return fmt.Errorf("nodePort not assigned for vmcp")
-			}
-			vmcpNodePort = service.Spec.Ports[0].NodePort
-			return nil
-		}, timeout, pollingInterval).Should(Succeed())
+		vmcpNodePort = GetVMCPNodePort(ctx, k8sClient, vmcpServerName, testNamespace, timeout, pollingInterval)
 
 		By(fmt.Sprintf("VirtualMCPServer accessible at http://localhost:%d", vmcpNodePort))
 		By("Backend servers use ClusterIP and are accessed through VirtualMCPServer")
@@ -258,7 +219,7 @@ var _ = Describe("VirtualMCPServer Discovered Mode", Ordered, func() {
 			Expect(err).ToNot(HaveOccurred())
 
 			initRequest := mcp.InitializeRequest{}
-			initRequest.Params.ProtocolVersion = "2024-11-05"
+			initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 			initRequest.Params.ClientInfo = mcp.Implementation{
 				Name:    "toolhive-e2e-test",
 				Version: "1.0.0",
@@ -307,7 +268,7 @@ var _ = Describe("VirtualMCPServer Discovered Mode", Ordered, func() {
 			Expect(err).ToNot(HaveOccurred())
 
 			initRequest := mcp.InitializeRequest{}
-			initRequest.Params.ProtocolVersion = "2024-11-05"
+			initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 			initRequest.Params.ClientInfo = mcp.Implementation{
 				Name:    "toolhive-e2e-test",
 				Version: "1.0.0",
@@ -337,13 +298,20 @@ var _ = Describe("VirtualMCPServer Discovered Mode", Ordered, func() {
 			if targetToolName != "" {
 				GinkgoWriter.Printf("Testing tool call for: %s\n", targetToolName)
 
+				// Use a standard timeout for the tool call
+				toolCallCtx, toolCallCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer toolCallCancel()
+
 				callRequest := mcp.CallToolRequest{}
 				callRequest.Params.Name = targetToolName
 				callRequest.Params.Arguments = map[string]any{
-					"url": "https://example.com",
+					// Use localhost to avoid external network dependencies
+					// The test validates that VirtualMCPServer can route tool calls to backends,
+					// not that the fetch tool itself works (that's tested in the backend's own tests)
+					"url": "http://127.0.0.1:1",
 				}
 
-				result, err := mcpClient.CallTool(ctx, callRequest)
+				result, err := mcpClient.CallTool(toolCallCtx, callRequest)
 				Expect(err).ToNot(HaveOccurred(),
 					fmt.Sprintf("Should be able to call tool '%s' through VirtualMCPServer", targetToolName))
 				Expect(result).ToNot(BeNil())

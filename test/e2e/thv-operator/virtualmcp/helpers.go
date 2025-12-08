@@ -8,6 +8,8 @@ import (
 	"os"
 	"time"
 
+	mcpclient "github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -19,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	mcpv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
+	"github.com/stacklok/toolhive/test/e2e/images"
 )
 
 // WaitForVirtualMCPServerReady waits for a VirtualMCPServer to reach Ready status
@@ -43,6 +46,62 @@ func WaitForVirtualMCPServerReady(ctx context.Context, c client.Client, name, na
 		}
 		return fmt.Errorf("ready condition not found")
 	}, timeout, 5*time.Second).Should(gomega.Succeed())
+}
+
+// InitializedMCPClient holds an initialized MCP client with its associated context
+type InitializedMCPClient struct {
+	Client *mcpclient.Client
+	Ctx    context.Context
+	Cancel context.CancelFunc
+}
+
+// Close cleans up the MCP client resources
+func (c *InitializedMCPClient) Close() {
+	if c.Cancel != nil {
+		c.Cancel()
+	}
+	if c.Client != nil {
+		_ = c.Client.Close()
+	}
+}
+
+// CreateInitializedMCPClient creates an MCP client, starts the transport, and initializes
+// the connection with the given client name. Returns an InitializedMCPClient that should
+// be closed when done using defer client.Close().
+func CreateInitializedMCPClient(nodePort int32, clientName string, timeout time.Duration) (*InitializedMCPClient, error) {
+	serverURL := fmt.Sprintf("http://localhost:%d/mcp", nodePort)
+	mcpClient, err := mcpclient.NewStreamableHttpClient(serverURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create MCP client: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+
+	if err := mcpClient.Start(ctx); err != nil {
+		cancel()
+		_ = mcpClient.Close()
+		return nil, fmt.Errorf("failed to start MCP client: %w", err)
+	}
+
+	initRequest := mcp.InitializeRequest{}
+	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initRequest.Params.Capabilities = mcp.ClientCapabilities{}
+	initRequest.Params.ClientInfo = mcp.Implementation{
+		Name:    clientName,
+		Version: "1.0.0",
+	}
+
+	if _, err := mcpClient.Initialize(ctx, initRequest); err != nil {
+		cancel()
+		_ = mcpClient.Close()
+		return nil, fmt.Errorf("failed to initialize MCP client: %w", err)
+	}
+
+	return &InitializedMCPClient{
+		Client: mcpClient,
+		Ctx:    ctx,
+		Cancel: cancel,
+	}, nil
 }
 
 // getPodLogs retrieves logs from a specific pod container
@@ -236,7 +295,7 @@ func DeployMockOIDCServerHTTP(ctx context.Context, c client.Client, namespace, s
 					Containers: []corev1.Container{
 						{
 							Name:    "mock-oidc",
-							Image:   "python:3.9-slim",
+							Image:   images.PythonImage,
 							Command: []string{"sh", "-c"},
 							Args:    []string{MockOIDCServerHTTPScript},
 							Ports: []corev1.ContainerPort{
@@ -295,7 +354,7 @@ func DeployInstrumentedBackendServer(ctx context.Context, c client.Client, names
 					Containers: []corev1.Container{
 						{
 							Name:    "instrumented-backend",
-							Image:   "python:3.9-slim",
+							Image:   images.PythonImage,
 							Command: []string{"sh", "-c"},
 							Args:    []string{InstrumentedBackendScript},
 							Ports: []corev1.ContainerPort{
@@ -376,6 +435,15 @@ func GetPodLogsForDeployment(ctx context.Context, c client.Client, namespace, de
 	return logs
 }
 
+// GetPodLogs returns logs from a specific pod and container
+func GetPodLogs(ctx context.Context, podName, namespace, containerName string) (string, error) {
+	logs, err := getPodLogs(ctx, namespace, podName, containerName, false)
+	if err != nil {
+		return "", fmt.Errorf("failed to get logs for pod %s container %s: %w", podName, containerName, err)
+	}
+	return logs, nil
+}
+
 func int32Ptr(i int32) *int32 {
 	return &i
 }
@@ -394,7 +462,7 @@ func GetServiceStats(ctx context.Context, c client.Client, namespace, serviceNam
 			Containers: []corev1.Container{
 				{
 					Name:    "curl",
-					Image:   "curlimages/curl:latest",
+					Image:   images.CurlImage,
 					Command: []string{"curl", "-s", fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/stats", serviceName, namespace, port)},
 				},
 			},
@@ -514,6 +582,117 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80)
 PYTHON_SCRIPT
 `
+
+// VMCPServiceName returns the Kubernetes service name for a VirtualMCPServer
+func VMCPServiceName(vmcpServerName string) string {
+	return fmt.Sprintf("vmcp-%s", vmcpServerName)
+}
+
+// CreateMCPGroupAndWait creates an MCPGroup and waits for it to become ready.
+// Returns the created MCPGroup after it reaches Ready phase.
+func CreateMCPGroupAndWait(
+	ctx context.Context,
+	c client.Client,
+	name, namespace, description string,
+	timeout, pollingInterval time.Duration,
+) *mcpv1alpha1.MCPGroup {
+	mcpGroup := &mcpv1alpha1.MCPGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: mcpv1alpha1.MCPGroupSpec{
+			Description: description,
+		},
+	}
+	gomega.Expect(c.Create(ctx, mcpGroup)).To(gomega.Succeed())
+
+	gomega.Eventually(func() bool {
+		err := c.Get(ctx, types.NamespacedName{
+			Name:      name,
+			Namespace: namespace,
+		}, mcpGroup)
+		if err != nil {
+			return false
+		}
+		return mcpGroup.Status.Phase == mcpv1alpha1.MCPGroupPhaseReady
+	}, timeout, pollingInterval).Should(gomega.BeTrue(), "MCPGroup should become ready")
+
+	return mcpGroup
+}
+
+// CreateMCPServerAndWait creates an MCPServer with the specified image and waits for it to be running.
+// Returns the created MCPServer after it reaches Running phase.
+func CreateMCPServerAndWait(
+	ctx context.Context,
+	c client.Client,
+	name, namespace, groupRef, image string,
+	timeout, pollingInterval time.Duration,
+) *mcpv1alpha1.MCPServer {
+	backend := &mcpv1alpha1.MCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: mcpv1alpha1.MCPServerSpec{
+			GroupRef:  groupRef,
+			Image:     image,
+			Transport: "streamable-http",
+			ProxyPort: 8080,
+			McpPort:   8080,
+			Env: []mcpv1alpha1.EnvVar{
+				{Name: "TRANSPORT", Value: "streamable-http"},
+			},
+		},
+	}
+	gomega.Expect(c.Create(ctx, backend)).To(gomega.Succeed())
+
+	gomega.Eventually(func() error {
+		server := &mcpv1alpha1.MCPServer{}
+		err := c.Get(ctx, types.NamespacedName{
+			Name:      name,
+			Namespace: namespace,
+		}, server)
+		if err != nil {
+			return fmt.Errorf("failed to get server: %w", err)
+		}
+		if server.Status.Phase == mcpv1alpha1.MCPServerPhaseRunning {
+			return nil
+		}
+		return fmt.Errorf("%s not ready yet, phase: %s", name, server.Status.Phase)
+	}, timeout, pollingInterval).Should(gomega.Succeed(), fmt.Sprintf("MCPServer %s should be ready", name))
+
+	return backend
+}
+
+// GetVMCPNodePort waits for the VirtualMCPServer service to have a NodePort assigned and returns it.
+func GetVMCPNodePort(
+	ctx context.Context,
+	c client.Client,
+	vmcpServerName, namespace string,
+	timeout, pollingInterval time.Duration,
+) int32 {
+	var nodePort int32
+	serviceName := VMCPServiceName(vmcpServerName)
+
+	gomega.Eventually(func() error {
+		service := &corev1.Service{}
+		err := c.Get(ctx, types.NamespacedName{
+			Name:      serviceName,
+			Namespace: namespace,
+		}, service)
+		if err != nil {
+			return err
+		}
+		if len(service.Spec.Ports) == 0 || service.Spec.Ports[0].NodePort == 0 {
+			return fmt.Errorf("nodePort not assigned for vmcp service %s", serviceName)
+		}
+		nodePort = service.Spec.Ports[0].NodePort
+		return nil
+	}, timeout, pollingInterval).Should(gomega.Succeed(), "NodePort should be assigned")
+
+	return nodePort
+}
 
 // InstrumentedBackendScript is an instrumented backend script that tracks Bearer tokens
 const InstrumentedBackendScript = `

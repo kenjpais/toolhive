@@ -273,6 +273,7 @@ func BuildRunnerConfig(
 	}
 
 	if runFlags.RemoteURL != "" {
+		logger.Debugf("Attempting to run remote MCP server: %s", runFlags.RemoteURL)
 		return buildRunnerConfig(ctx, runFlags, cmdArgs, debugMode, validatedHost, rt, runFlags.RemoteURL, nil,
 			nil, envVarValidator, oidcConfig, telemetryConfig)
 	}
@@ -548,7 +549,7 @@ func configureMiddlewareAndOptions(
 			runFlags.ThvCABundle, runFlags.JWKSAuthTokenFile, runFlags.ResourceURL,
 			runFlags.JWKSAllowPrivateIP, runFlags.InsecureAllowHTTP,
 		),
-		runner.WithTelemetryConfig(finalOtelEndpoint, runFlags.OtelEnablePrometheusMetricsPath,
+		runner.WithTelemetryConfigFromFlags(finalOtelEndpoint, runFlags.OtelEnablePrometheusMetricsPath,
 			runFlags.OtelTracingEnabled, runFlags.OtelMetricsEnabled, runFlags.OtelServiceName,
 			finalOtelSamplingRate, runFlags.OtelHeaders, runFlags.OtelInsecure, finalOtelEnvironmentVariables,
 		),
